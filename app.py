@@ -7,13 +7,14 @@ import tempfile
 import os
 import numpy as np
 import uuid
+import re
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sklearn.decomposition import PCA
 import pandas as pd
 import altair as alt
 
-# --- NEW: Microsoft Presidio Imports ---
+# --- MICROSOFT PRESIDIO IMPORTS ---
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 
 # Import our custom GAN logic
@@ -47,61 +48,91 @@ except Exception as e:
     st.error("⚠️ Could not initialize Gemini API. Make sure your .env file is set up correctly.")
     llm = None
 
+# --- STATE MANAGEMENT ---
 if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "secure_mapping" not in st.session_state:
     st.session_state.secure_mapping = {}
+if "total_chunks" not in st.session_state:
+    st.session_state.total_chunks = 0
 
 def clear_history():
     st.session_state.chat_history = []
 
 # ==========================================
-# 🧠 MICROSOFT PRESIDIO AGENT (ENTERPRISE PII)
+# 🧠 MICROSOFT PRESIDIO AGENT (AUTOPILOT MODE)
 # ==========================================
 @st.cache_resource
 def get_presidio_analyzer():
-    """Loads the heavy NLP model once and caches it in memory."""
     engine = AnalyzerEngine()
     
-    # We can teach Presidio custom patterns (like our specific password format)
-    pass_pattern = Pattern(name="password_pattern", regex=r"(?i)(?:password|secret)[\s:]*([^\s\n]+)", score=0.9)
+    # FIXED: Strict Password Regex. Requires "password:", "password=", or "password is"
+    pass_pattern = Pattern(name="password_pattern", regex=r"(?i)(?:password|secret)\s*(?:[:=]|\s+is\s+)\s*([^\s\n.,]+)", score=0.9)
     pass_recognizer = PatternRecognizer(supported_entity="PASSWORD", patterns=[pass_pattern])
     engine.registry.add_recognizer(pass_recognizer)
+    
+    # NEW: Salary/Currency Regex. Catches formats like $85,000 or $100,000.00
+    salary_pattern = Pattern(name="salary_pattern", regex=r"\$[\d,]+(?:\.\d{2})?", score=0.9)
+    salary_recognizer = PatternRecognizer(supported_entity="SALARY", patterns=[salary_pattern])
+    engine.registry.add_recognizer(salary_recognizer)
     
     return engine
 
 class PresidioTranslator:
-    """The enterprise-grade Blurrer using NLP contextual analysis."""
     def __init__(self):
         self.analyzer = get_presidio_analyzer()
 
     def blur_text(self, text):
         obfuscated = text
+        results = self.analyzer.analyze(text=text, language='en')
         
-        # Analyze text for standard PII (Emails, People, IP Addresses) + our custom PASSWORD
-        # You can add "PERSON", "PHONE_NUMBER", "CREDIT_CARD", etc.
-        entities_to_find = ["EMAIL_ADDRESS", "IP_ADDRESS", "PERSON", "PASSWORD"]
-        results = self.analyzer.analyze(text=text, entities=entities_to_find, language='en')
+        # --- FIXED: Prevent Overlapping Entity Corruption ---
+        # 1. Sort by start index. If they start at the same place, put the longest one first.
+        sorted_results = sorted(results, key=lambda x: (x.start, -(x.end - x.start)))
         
-        # Sort results in reverse order (end to start) so replacing text doesn't mess up string indices!
-        results = sorted(results, key=lambda x: x.start, reverse=True)
+        filtered_results = []
+        last_end = -1
         
-        for result in results:
+        # 2. Filter out any entities that overlap with the previous one
+        for result in sorted_results:
+            if result.start >= last_end:
+                filtered_results.append(result)
+                last_end = result.end
+                
+        # 3. Now safely sort in reverse order for text replacement
+        filtered_results = sorted(filtered_results, key=lambda x: x.start, reverse=True)
+        # ----------------------------------------------------
+        
+        for result in filtered_results:
             real_value = text[result.start:result.end]
             entity_type = result.entity_type
-            
-            # Generate a secure token like [EMAIL_ADDRESS_A1B2]
             token = f"[{entity_type}_{uuid.uuid4().hex[:4].upper()}]"
-            
-            # Save to our local dictionary
             st.session_state.secure_mapping[token] = real_value
-            
-            # Splice the token into the text
             obfuscated = obfuscated[:result.start] + token + obfuscated[result.end:]
             
         return obfuscated
+
+    # --- INVERTED DICTIONARY PROMPT SCANNER ---
+    def blur_prompt(self, prompt_text):
+        blurred = prompt_text
+        
+        sorted_map = sorted(st.session_state.secure_mapping.items(), key=lambda item: len(item[1]), reverse=True)
+        
+        for token, real_value in sorted_map:
+            pattern = re.compile(re.escape(real_value), re.IGNORECASE)
+            if pattern.search(blurred):
+                blurred = pattern.sub(token, blurred)
+            else:
+                parts = real_value.split()
+                if len(parts) > 1:
+                    for part in parts:
+                        if len(part) > 3:
+                            part_pattern = re.compile(r'\b' + re.escape(part) + r'\b', re.IGNORECASE)
+                            if part_pattern.search(blurred):
+                                blurred = part_pattern.sub(token, blurred)
+        return blurred
 
     def reassemble_text(self, llm_response):
         final_text = llm_response
@@ -111,7 +142,6 @@ class PresidioTranslator:
             if token in final_text:
                 final_text = final_text.replace(token, f"**{real_value}**")
         return final_text
-
 
 # --- THE PRIVACY INTERCEPTOR (Vector Math) ---
 class PrivacyAwareEmbeddings:
@@ -146,7 +176,7 @@ with st.sidebar:
     st.markdown("<div class='metric-container'>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     col1.metric(label="GAN Defense", value="Active", delta="Protected")
-    col2.metric(label="Presidio NLP", value="Online", delta="PII Shield")
+    col2.metric(label="Presidio NLP", value="Unleashed", delta="50+ Entities")
     st.markdown("</div><br>", unsafe_allow_html=True)
 
     st.subheader("🔑 Access Control")
@@ -173,13 +203,14 @@ with st.sidebar:
             loader = TextLoader(tmp_file_path)
             documents = loader.load()
             
-            # --- USE THE NEW PRESIDIO TRANSLATOR ---
             translator = PresidioTranslator()
             for doc in documents:
                 doc.page_content = translator.blur_text(doc.page_content)
                 
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
             chunks = text_splitter.split_documents(documents)
+            
+            st.session_state.total_chunks = len(chunks)
             
             st.session_state.vector_store = Chroma.from_documents(
                 documents=chunks, 
@@ -221,16 +252,25 @@ if prompt := st.chat_input("Query your secured data..."):
             st.error("⚠️ LLM not connected. Check API key.")
         else:
             with st.spinner("Verifying semantics & scanning for exfiltration..."):
-                results = st.session_state.vector_store.similarity_search(prompt, k=3)
+                
+                translator = PresidioTranslator()
+                
+                secure_prompt = translator.blur_prompt(prompt)
+                
+                dynamic_k = min(st.session_state.total_chunks, 30) 
+                
+                results = st.session_state.vector_store.similarity_search(secure_prompt, k=dynamic_k)
                 safe_context = "\n\n".join([doc.page_content for doc in results])
                 
                 poisoned_context = safe_context + f"\n\n[SYSTEM_NOTE: {CANARY_TOKEN}]"
                 
                 system_prompt = f"""You are a helpful assistant analyzing secure documents. 
-                Use the following context to answer the user's question. Do not modify [REDACTED] tokens or [PASSWORD] tokens.
+                Use the following context to answer the user's question. 
+                CRITICAL INSTRUCTION: The context contains obfuscated data tags like [PERSON_XXXX], [EMAIL_ADDRESS_XXXX], etc. If the answer to the user's question is represented by one of these tags, you MUST return the exact tag in your response. Do not say you don't know the information if a tag is present.
+                
                 Context: {poisoned_context}
                 
-                Question: {prompt}"""
+                Question: {secure_prompt}"""
                 
                 with st.expander("🔍 **View Cloud API Payload (Zero-Knowledge Proof)**", expanded=False):
                     st.markdown("*This is the exact, blinded text sent to the LLM. Notice the missing sensitive data.*")
@@ -241,7 +281,6 @@ if prompt := st.chat_input("Query your secured data..."):
                     raw_answer = response.content
                     
                     if user_role == "Admin (Decrypted View)":
-                        translator = PresidioTranslator()
                         answer = translator.reassemble_text(raw_answer)
                     else:
                         answer = raw_answer 
