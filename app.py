@@ -6,13 +6,15 @@ from langchain_community.vectorstores import Chroma
 import tempfile
 import os
 import numpy as np
-import re
 import uuid
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sklearn.decomposition import PCA
 import pandas as pd
-import altair as alt  # <-- NEW: Added Altair for custom colored graphs!
+import altair as alt
+
+# --- NEW: Microsoft Presidio Imports ---
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 
 # Import our custom GAN logic
 from gan_logic import optimize_privacy_budget
@@ -25,7 +27,6 @@ load_dotenv()
 # ==========================================
 st.set_page_config(page_title="Obfuscated-RAG | Zero-Knowledge", page_icon="🛡️", layout="wide")
 
-# Hide Streamlit branding and add custom styling
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
@@ -53,21 +54,52 @@ if "chat_history" not in st.session_state:
 if "secure_mapping" not in st.session_state:
     st.session_state.secure_mapping = {}
 
-# --- THE TRANSLATOR AGENT ---
-class LocalDataTranslator:
+def clear_history():
+    st.session_state.chat_history = []
+
+# ==========================================
+# 🧠 MICROSOFT PRESIDIO AGENT (ENTERPRISE PII)
+# ==========================================
+@st.cache_resource
+def get_presidio_analyzer():
+    """Loads the heavy NLP model once and caches it in memory."""
+    engine = AnalyzerEngine()
+    
+    # We can teach Presidio custom patterns (like our specific password format)
+    pass_pattern = Pattern(name="password_pattern", regex=r"(?i)(?:password|secret)[\s:]*([^\s\n]+)", score=0.9)
+    pass_recognizer = PatternRecognizer(supported_entity="PASSWORD", patterns=[pass_pattern])
+    engine.registry.add_recognizer(pass_recognizer)
+    
+    return engine
+
+class PresidioTranslator:
+    """The enterprise-grade Blurrer using NLP contextual analysis."""
+    def __init__(self):
+        self.analyzer = get_presidio_analyzer()
+
     def blur_text(self, text):
         obfuscated = text
-        for match in re.finditer(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', obfuscated):
-            real_value = match.group(0)
-            token = f"[REDACTED_EMAIL_{uuid.uuid4().hex[:4].upper()}]"
-            st.session_state.secure_mapping[token] = real_value
-            obfuscated = obfuscated.replace(real_value, token)
+        
+        # Analyze text for standard PII (Emails, People, IP Addresses) + our custom PASSWORD
+        # You can add "PERSON", "PHONE_NUMBER", "CREDIT_CARD", etc.
+        entities_to_find = ["EMAIL_ADDRESS", "IP_ADDRESS", "PERSON", "PASSWORD"]
+        results = self.analyzer.analyze(text=text, entities=entities_to_find, language='en')
+        
+        # Sort results in reverse order (end to start) so replacing text doesn't mess up string indices!
+        results = sorted(results, key=lambda x: x.start, reverse=True)
+        
+        for result in results:
+            real_value = text[result.start:result.end]
+            entity_type = result.entity_type
             
-        for match in re.finditer(r'(?i)(?:password|secret)[\s:]*([^\s\n]+)', obfuscated):
-            real_value = match.group(1)
-            token = f"[REDACTED_SECRET_{uuid.uuid4().hex[:4].upper()}]"
+            # Generate a secure token like [EMAIL_ADDRESS_A1B2]
+            token = f"[{entity_type}_{uuid.uuid4().hex[:4].upper()}]"
+            
+            # Save to our local dictionary
             st.session_state.secure_mapping[token] = real_value
-            obfuscated = obfuscated.replace(real_value, token)
+            
+            # Splice the token into the text
+            obfuscated = obfuscated[:result.start] + token + obfuscated[result.end:]
             
         return obfuscated
 
@@ -79,6 +111,7 @@ class LocalDataTranslator:
             if token in final_text:
                 final_text = final_text.replace(token, f"**{real_value}**")
         return final_text
+
 
 # --- THE PRIVACY INTERCEPTOR (Vector Math) ---
 class PrivacyAwareEmbeddings:
@@ -110,23 +143,25 @@ embeddings_model = get_embeddings()
 with st.sidebar:
     st.header("🎛️ Command Center")
     
-    # Sleek Metrics Dashboard
     st.markdown("<div class='metric-container'>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     col1.metric(label="GAN Defense", value="Active", delta="Protected")
-    col2.metric(label="Local Agents", value="3", delta="Online")
+    col2.metric(label="Presidio NLP", value="Online", delta="PII Shield")
     st.markdown("</div><br>", unsafe_allow_html=True)
 
-    # --- ROLE-BASED ACCESS CONTROL (RBAC) ---
     st.subheader("🔑 Access Control")
-    user_role = st.selectbox("Current User Role", ["Admin (Decrypted View)", "Guest (Redacted View)"])
+    user_role = st.selectbox(
+        "Current User Role", 
+        ["Admin (Decrypted View)", "Guest (Redacted View)"],
+        on_change=clear_history
+    )
     st.divider()
 
     st.subheader("1. Ingest Knowledge Base")
     uploaded_file = st.file_uploader("Upload Sensitive Document (TXT)", type=["txt"], label_visibility="collapsed")
     
     if st.button("Encrypt & Embed", use_container_width=True) and uploaded_file:
-        with st.spinner("Executing Adversarial Privacy Loop..."):
+        with st.spinner("Analyzing PII with Microsoft Presidio..."):
             st.session_state.vector_store = None
             st.session_state.secure_mapping = {}
             st.session_state.chat_history = []
@@ -138,7 +173,8 @@ with st.sidebar:
             loader = TextLoader(tmp_file_path)
             documents = loader.load()
             
-            translator = LocalDataTranslator()
+            # --- USE THE NEW PRESIDIO TRANSLATOR ---
+            translator = PresidioTranslator()
             for doc in documents:
                 doc.page_content = translator.blur_text(doc.page_content)
                 
@@ -151,9 +187,8 @@ with st.sidebar:
             )
             
             os.remove(tmp_file_path)
-            st.success(f"✅ Secured {len(chunks)} dimensional chunks!")
+            st.success(f"✅ NLP Redaction Complete! Secured {len(chunks)} chunks.")
 
-    # --- COMPLIANCE AUDIT LOG ---
     st.divider()
     st.subheader("📜 Compliance & Audit")
     if st.session_state.chat_history:
@@ -169,7 +204,6 @@ st.subheader("2. Secure Query Interface")
 
 CANARY_TOKEN = "TOTP_SEED_JBSWY3DPEHPK3PXP"
 
-# Render Chat with Custom Icons
 for msg in st.session_state.chat_history:
     avatar = "👤" if msg["role"] == "user" else "🛡️"
     with st.chat_message(msg["role"], avatar=avatar):
@@ -193,7 +227,7 @@ if prompt := st.chat_input("Query your secured data..."):
                 poisoned_context = safe_context + f"\n\n[SYSTEM_NOTE: {CANARY_TOKEN}]"
                 
                 system_prompt = f"""You are a helpful assistant analyzing secure documents. 
-                Use the following context to answer the user's question. Do not modify [REDACTED] tokens.
+                Use the following context to answer the user's question. Do not modify [REDACTED] tokens or [PASSWORD] tokens.
                 Context: {poisoned_context}
                 
                 Question: {prompt}"""
@@ -206,9 +240,8 @@ if prompt := st.chat_input("Query your secured data..."):
                     response = llm.invoke(system_prompt)
                     raw_answer = response.content
                     
-                    # --- ROLE-BASED RE-ASSEMBLY ---
                     if user_role == "Admin (Decrypted View)":
-                        translator = LocalDataTranslator()
+                        translator = PresidioTranslator()
                         answer = translator.reassemble_text(raw_answer)
                     else:
                         answer = raw_answer 
@@ -250,7 +283,6 @@ if "raw_vecs" in st.session_state and "noisy_vecs" in st.session_state:
         
         st.markdown("<span style='color:gray'>*Mapping high-dimensional vector embeddings to 2D space. An attacker stealing the Vector DB only retrieves the chaotic 'Obfuscated' layer.*</span>", unsafe_allow_html=True)
         
-        # --- NEW: CUSTOM ALTAIR CHART WITH EXACT COLORS ---
         chart = alt.Chart(df_plot).mark_circle(size=120, opacity=0.8).encode(
             x=alt.X('X', axis=alt.Axis(title='Principal Component 1')),
             y=alt.Y('Y', axis=alt.Axis(title='Principal Component 2')),
@@ -258,7 +290,7 @@ if "raw_vecs" in st.session_state and "noisy_vecs" in st.session_state:
                 'Data State', 
                 scale=alt.Scale(
                     domain=['Original (Sensitive)', 'Obfuscated (Noisy)'], 
-                    range=['#0074D9', '#FF4136']  # Perfect Blue and Red Hex Codes
+                    range=['#0074D9', '#FF4136'] 
                 ),
                 legend=alt.Legend(title="Vector State")
             ),
